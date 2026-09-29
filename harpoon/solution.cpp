@@ -18,10 +18,13 @@
 //  interviewer will walk you through the tasks.
 // =============================================================================
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -48,6 +51,45 @@ inline bool parse_uint_ascii(const char* data, std::size_t first,
         value = value * 10 + d;
     }
     out = value;
+    return true;
+}
+
+// [Task 6] Parses a decimal price as fixed-point with 8 implied decimals:
+// "43125.5" -> 4312550000000. Accepts -?digits(.digits)? with at most 8
+// decimals. Returns false for anything else, or if it overflows int64_t.
+inline bool parse_price(const char* first, const char* last,
+                        std::int64_t& out) noexcept {
+    constexpr int kDecimals = 8;
+    constexpr std::uint64_t kMax = std::numeric_limits<std::int64_t>::max();
+    std::uint64_t mag = 0;
+    auto push = [&](char c) {
+        std::uint64_t d = static_cast<std::uint64_t>(c - '0');
+        if (mag > (kMax - d) / 10) return false;
+        mag = mag * 10 + d;
+        return true;
+    };
+
+    const char* p = first;
+    bool neg = p < last && *p == '-';
+    if (neg) ++p;
+
+    const char* int_start = p;
+    while (p < last && is_digit(*p))
+        if (!push(*p++)) return false;
+    if (p == int_start) return false;
+
+    int decimals = 0;
+    if (p < last && *p == '.') {
+        const char* frac_start = ++p;
+        while (p < last && is_digit(*p))
+            if (++decimals > kDecimals || !push(*p++)) return false;
+        if (p == frac_start) return false;
+    }
+    if (p != last) return false;
+
+    for (; decimals < kDecimals; ++decimals)
+        if (!push('0')) return false;
+    out = neg ? -static_cast<std::int64_t>(mag) : static_cast<std::int64_t>(mag);
     return true;
 }
 
@@ -78,6 +120,8 @@ class Parser {
     // header makes the parser buffer forever while waiting for bytes that will
     // never arrive.
     static constexpr std::size_t kMaxBodyLength = 64 * 1024;
+    // "8=FIXT.1.1<SOH>" is 11 bytes; leave some room.
+    static constexpr std::size_t kMaxBeginStringField = 16;
 
     Handler& handler;
     std::vector<char> pending;
@@ -126,8 +170,23 @@ class Parser {
             return true;
         }
 
-        std::size_t begin_field_end = find_char(data, n, 0, SOH);
-        if (begin_field_end == n) return false;
+        // [Task 2] BeginString must start with "FIX" and be short. Without
+        // this check, "8=" junk joins onto the next message's header to
+        // form one frame, and about 1 in 256 of those frames passes the 8-bit
+        // checksum. Capping the SOH search also stops "8=" with no SOH
+        // after it from buffering forever.
+        if (n < 5) return false;
+        if (std::memcmp(data, "8=FIX", 5) != 0) {
+            consumed = 1;
+            return true;
+        }
+        std::size_t begin_limit = std::min(n, kMaxBeginStringField);
+        std::size_t begin_field_end = find_char(data, begin_limit, 0, SOH);
+        if (begin_field_end == begin_limit) {
+            if (begin_limit < kMaxBeginStringField) return false;
+            consumed = 1;
+            return true;
+        }
 
         std::size_t body_len_tag = begin_field_end + 1;
         if (body_len_tag + 2 > n) return false;
@@ -138,9 +197,16 @@ class Parser {
         }
 
         std::size_t body_len_value_start = body_len_tag + 2;
+        // [Task 2] Same idea for 9=: at most 20 digits before the SOH.
+        std::size_t body_len_cap = body_len_value_start + 21;
+        std::size_t body_len_limit = std::min(n, body_len_cap);
         std::size_t body_len_field_end =
-            find_char(data, n, body_len_value_start, SOH);
-        if (body_len_field_end == n) return false;
+            find_char(data, body_len_limit, body_len_value_start, SOH);
+        if (body_len_field_end == body_len_limit) {
+            if (body_len_limit < body_len_cap) return false;
+            consumed = 1;
+            return true;
+        }
 
         std::size_t body_length = 0;
         if (!parse_uint_ascii(data, body_len_value_start, body_len_field_end,
@@ -188,6 +254,12 @@ class Parser {
         handler.on_message_begin(msg);
         const char* p = msg.data();
         const char* end = msg.data() + msg.size();
+        auto fail = [&] { handler.on_message_error(); };
+
+        // [Task 4] Set by tag 95 (RawDataLength). The next field must be 96
+        // and its value is exactly raw_len bytes, which may include SOH.
+        std::size_t raw_len = 0;
+        bool raw_pending = false;
 
         while (p < end) {
             // [Task 3] A tag is one or more digits followed by '='. The
@@ -195,34 +267,69 @@ class Parser {
             // merged "55<SOH>44=1.5" into the tag "55\x0144".
             const char* tag = p;
             while (p < end && is_digit(*p)) ++p;
-            if (p == tag || p == end || *p != '=') {
-                handler.on_message_error();
-                return;
-            }
-            const char* eq = p;
+            if (p == tag || p == end || *p != '=') return fail();
+            std::size_t tag_len = static_cast<std::size_t>(p - tag);
             ++p;
 
             const char* value = p;
-            while (p < end && *p != SOH) ++p;
-            if (p == end) {  // unreachable given framing, but keep B/E|X paired
-                handler.on_message_error();
-                return;
+            const char* value_end;
+            if (raw_pending) {
+                if (tag_len != 2 || tag[0] != '9' || tag[1] != '6' ||
+                    raw_len >= static_cast<std::size_t>(end - value) ||
+                    value[raw_len] != SOH)
+                    return fail();
+                value_end = value + raw_len;
+                raw_pending = false;
+            } else {
+                while (p < end && *p != SOH) ++p;
+                if (p == end) return fail();  // unreachable given framing
+                value_end = p;
             }
-            const char* value_end = p;
-            ++p;
+            p = value_end + 1;
+            std::size_t value_len = static_cast<std::size_t>(value_end - value);
 
-            handler.on_field(tag, static_cast<std::size_t>(eq - tag), value,
-                             static_cast<std::size_t>(value_end - value));
+            if (tag_len == 2 && tag[0] == '9' && tag[1] == '5') {
+                // Only guards overflow; whether the length fits is checked
+                // when field 96 is read.
+                if (!parse_uint_ascii(value, 0, value_len,
+                                      std::numeric_limits<std::size_t>::max(),
+                                      raw_len))
+                    return fail();
+                raw_pending = true;
+            }
+            handler.on_field(tag, tag_len, value, value_len);
         }
+        if (raw_pending) return fail();  // 95 was the last field
         handler.on_message_end();
     }
+
+    // [Task 5] Bytes fed from inside a handler callback go into `deferred`
+    // and are parsed after the current batch. Appending straight to
+    // `pending` could reallocate it under the pointers we've handed to the
+    // handler. Recursing into parse_pending would re-parse the in-flight
+    // message (read_pos hasn't advanced yet) and then clear the buffer
+    // underneath the outer call.
+    bool parsing = false;
+    std::vector<char> deferred;
 
 public:
     explicit Parser(Handler& h) : handler(h) { pending.reserve(8192); }
 
     void feed(std::span<const char> bytes) {
+        if (parsing) {
+            deferred.insert(deferred.end(), bytes.begin(), bytes.end());
+            return;
+        }
+        parsing = true;
         pending.insert(pending.end(), bytes.begin(), bytes.end());
         parse_pending();
+        while (!deferred.empty()) {
+            std::vector<char> next;
+            next.swap(deferred);
+            pending.insert(pending.end(), next.begin(), next.end());
+            parse_pending();
+        }
+        parsing = false;
     }
 };
 
@@ -234,7 +341,7 @@ public:
 
 // Logs every callback as text so tests can compare against the expected events.
 //   "B"          on_message_begin
-//   "35=D"       on_field
+//   "35=D"       on_field (SOH inside a value is shown as '|')
 //   "E"          on_message_end
 //   "X"          on_message_error
 struct RecordingHandler {
@@ -242,7 +349,9 @@ struct RecordingHandler {
 
     void on_message_begin(std::span<const char>) { events.push_back("B"); }
     void on_field(const char* t, std::size_t tl, const char* v, std::size_t vl) {
-        events.push_back(std::string(t, tl) + "=" + std::string(v, vl));
+        std::string value(v, vl);
+        for (char& c : value) if (c == harpoon::SOH) c = '|';
+        events.push_back(std::string(t, tl) + "=" + value);
     }
     void on_message_end() { events.push_back("E"); }
     void on_message_error() { events.push_back("X"); }
@@ -283,16 +392,75 @@ std::vector<std::string> run(const std::string& input, std::size_t chunk) {
     return h.events;
 }
 
+// Calls feed() on its own parser from inside on_field, as a handler that
+// replays or forwards messages might.
+struct ReentrantHandler : RecordingHandler {
+    harpoon::Parser<ReentrantHandler>* parser = nullptr;
+    std::string trigger;  // the field that triggers the feed, e.g. "55=XBT/USD"
+    std::string inject;   // the bytes it feeds (sent once)
+
+    void on_field(const char* t, std::size_t tl, const char* v, std::size_t vl) {
+        RecordingHandler::on_field(t, tl, v, vl);
+        if (!inject.empty() && events.back() == trigger) {
+            std::string bytes = std::move(inject);
+            inject.clear();
+            parser->feed(bytes);
+        }
+    }
+};
+
+std::vector<std::string> run_reentrant(const std::string& input,
+                                       const std::string& trigger,
+                                       const std::string& inject) {
+    ReentrantHandler h;
+    harpoon::Parser<ReentrantHandler> p{h};
+    h.parser = &p;
+    h.trigger = trigger;
+    h.inject = inject;
+    p.feed(input);
+    return h.events;
+}
+
 int failures = 0;
 
-void check(const char* name, const std::string& input,
-           const std::string& expected, std::size_t chunk = 4096) {
-    std::string got = join(run(input, chunk));
+void report(const char* name, const std::string& got,
+            const std::string& expected) {
     bool ok = got == expected;
     if (!ok) ++failures;
     std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", name);
+    auto clip = [](const std::string& s) {
+        return s.size() <= 300 ? s
+             : s.substr(0, 300) + "... (" + std::to_string(s.size()) + " chars)";
+    };
     if (!ok) std::printf("    expected: %s\n    got:      %s\n",
-                         expected.c_str(), got.c_str());
+                         clip(expected).c_str(), clip(got).c_str());
+    std::fflush(stdout);
+}
+
+void check(const char* name, const std::string& input,
+           const std::string& expected, std::size_t chunk = 4096) {
+    report(name, join(run(input, chunk)), expected);
+}
+
+struct PriceCase {
+    const char* text;
+    bool ok;
+    std::int64_t value;
+};
+
+void check_prices(const char* name, std::initializer_list<PriceCase> cases) {
+    std::string got, expected;
+    for (const PriceCase& c : cases) {
+        std::int64_t out = 0;
+        bool ok = harpoon::parse_price(c.text, c.text + std::strlen(c.text), out);
+        std::string g = ok ? std::to_string(out) : "reject";
+        std::string e = c.ok ? std::to_string(c.value) : "reject";
+        if (g != e) {
+            got += std::string(got.empty() ? "" : ", ") + '"' + c.text + "\"->" + g;
+            expected += std::string(expected.empty() ? "" : ", ") + '"' + c.text + "\"->" + e;
+        }
+    }
+    report(name, got, expected);
 }
 
 int main() {
@@ -322,6 +490,11 @@ int main() {
     std::string overflow = "8=FIX.4.4\x01" "9=18446744073709551" +
                            std::to_string(616 + A.size() - 7) + "\x01";
     check("6. BodyLength overflow", overflow + A, evA, 64);
+    // A run of "8=" junk just before a real message must not be joined onto
+    // it to form one message with a giant BeginString.
+    std::string junk;
+    for (int i = 0; i < 20000; ++i) junk += "8=";
+    check("7. \"8=\" junk before a message", junk + A, evA);
 
     // ---- Task 3: malformed fields ---------------------------------------
     // The frame and checksum are valid, but one field has no '='. Every
@@ -329,10 +502,57 @@ int main() {
     // field is malformed.
     // Tags must also be non-empty and all digits.
     const std::string C = make_msg("35=D|55|44=1.5|");
-    check("7. field without '=' is rejected", C + B,
+    check("8. field without '=' is rejected", C + B,
           "B 8=FIX.4.4 9=15 35=D X " + evB);
     const std::string D = make_msg("35=D|=oops|");
-    check("8. empty tag is rejected", D + B, "B 8=FIX.4.4 9=11 35=D X " + evB);
+    check("9. empty tag is rejected", D + B, "B 8=FIX.4.4 9=11 35=D X " + evB);
+
+    // =====================================================================
+    //  Stretch tasks: the interviewer will pick which ones to do.
+    // =====================================================================
+
+    // ---- Task 4: RawData ------------------------------------------------
+    // Tag 95 (RawDataLength) gives the exact byte length of the value of
+    // the field that must follow it, tag 96 (RawData). That value can contain
+    // SOH and '=' (it's binary). If 96 doesn't follow or the length doesn't
+    // fit, send an "X".
+    const std::string R = make_msg("35=D|95=5|96=a|b=c|55=X|");
+    check("10. RawData may contain SOH and '='", R,
+          "B 8=FIX.4.4 9=24 35=D 95=5 96=a|b=c 55=X 10=" +
+          R.substr(R.size() - 4, 3) + " E");
+    const std::string R2 = make_msg("35=D|95=50|96=abc|");
+    check("11. RawData length past the end is rejected", R2 + B,
+          "B 8=FIX.4.4 9=18 35=D 95=50 X " + evB);
+
+    // ---- Task 6: fixed-point prices -------------------------------------
+    // See parse_price() at the top of the file.
+    check_prices("12. parse_price", {
+        {"0.1", true, 10000000},
+        {"-2.5", true, -250000000},
+        {"43125.5", true, 4312550000000},
+        {"0.00000001", true, 1},
+        {"92233720368.54775807", true, 9223372036854775807},
+        {"92233720368.54775808", false, 0},
+        {"1.123456789", false, 0},
+        {"", false, 0},
+        {"-", false, 0},
+        {"1.", false, 0},
+        {".5", false, 0},
+        {"1.2.3", false, 0},
+        {"+1", false, 0},
+        {"1e5", false, 0},
+    });
+
+    // ---- Task 5: re-entrant feed() ---------------------------------------
+    // A handler may call feed() on the same parser from inside a callback.
+    // Those bytes must be parsed after the current message, in order, and
+    // every message delivered exactly once.
+    // (These run last because, before the fix, they can crash.)
+    report("13. feed() from inside on_field",
+           join(run_reentrant(A, "55=XBT/USD", B)), evA + " " + evB);
+    report("14. feed() from inside on_field, large (buffer reallocates)",
+           join(run_reentrant(A, "55=XBT/USD", std::string(20000, 'z') + B)),
+           evA + " " + evB);
 
     std::printf("\n%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
