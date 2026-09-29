@@ -6,8 +6,8 @@ The exercise uses the candidate's **own order book code**, trimmed to one file s
 
 | File | Use |
 |---|---|
-| `candidate.cpp` | Paste into CoderPad (C++, add `-std=c++20`). 8 tests fail at the start (Parts 2–3 plus the optional test). |
-| `solution.cpp` | Reference solution, interviewer only. All 15 tests pass, plus 2 bonus tests. |
+| `candidate.cpp` | Paste into CoderPad (C++, add `-std=c++20`). 12 tests fail at the start (Parts 2–3 plus the optional tests). |
+| `solution.cpp` | Reference solution, interviewer only. All 20 tests pass, plus 2 bonus tests. |
 
 Local check: `g++ -std=c++20 -O1 -g -fsanitize=address,undefined candidate.cpp && ./a.out`
 
@@ -19,9 +19,10 @@ Local check: `g++ -std=c++20 -O1 -g -fsanitize=address,undefined candidate.cpp &
 | 10–25 | Part 2: implement `reduce_order` + ownership checks |
 | 25–45 | Part 3: implement `cancel_all` for an account |
 | 45–60 | Part 4: discussion / bonus bug |
-| *if time* | **Optional:** debug the crossed book (use in place of Part 4, or for a strong candidate who finishes early) |
+| *if time* | **Optional A:** debug the crossed book |
+| *if time* | **Optional B:** support arbitrary order expiry times |
 
-The optional test fails from the start. Tell the candidate up front to ignore it unless you bring it up.
+Use an optional part in place of Part 4, or for a strong candidate who finishes early. Optional A is debugging; Optional B is design + implementation and fits well after Part 3. The optional tests fail from the start, so tell the candidate up front to ignore any test named `OPTIONAL` unless you bring it up.
 
 ---
 
@@ -78,9 +79,9 @@ Fix: a live bit per slot (`solution.cpp`), or gen parity (odd = live, 1 bit, no 
 - **SPSC queue:** the memory ordering is correct, but `push`/`pop` load the other side's atomic every call, which moves that cache line between cores. Their own benchmark shows ring transit is 87% of latency. Ask how they'd reduce it: cache the other side's index locally and only reload it when the ring looks full/empty, and batch pops.
 - **Gateway `send_all`** on a non-blocking fd returns on `EAGAIN` in the middle of a frame, so a slow client receives a torn message and every later frame is misaligned. Discuss per-session send buffers / disconnecting slow consumers.
 
-## Optional: Debug the crossed book (15–20 min)
+## Optional A: Debug the crossed book (15–20 min)
 
-Test: **`OPTIONAL: large sweep never leaves a crossed book`**. 100 resting asks of qty 1 @ 100, then a buy of 100 @ 100.
+Test: **`OPTIONAL A: large sweep never leaves a crossed book`**. 100 resting asks of qty 1 @ 100, then a buy of 100 @ 100.
 
 **Root cause:** `match()` does `if (fill_count >= max_fills) return;`. With `MAX_FILLS_PER_ORDER = 64` (the same value as `Shard` in the repo), matching stops after 64 fills. `add_order` then sees `o.qty > 0` and **rests the leftover 36 as a bid at 100 while 36 asks at 100 are still on the book**. The book is crossed, and the next incoming order will produce nonsense.
 
@@ -97,6 +98,25 @@ Test: **`OPTIONAL: large sweep never leaves a crossed book`**. 100 resting asks 
 
 **Follow-up:** "The sink pushes into an SPSC ring that can be full. What happens then?" `Shard::push_out` busy-spins, so one slow gateway stalls matching for every symbol on that shard. Discuss backpressure: reject new orders when the outbound ring is above a high-water mark, size the rings to the worst-case burst, etc.
 
+## Optional B: Arbitrary expiry times (20 min)
+
+Their engine only has `GTC` (rests until filled or cancelled) and `IOC` (the leftover is dropped straight away), so orders never expire. This part adds **good-till-time** orders: `NewOrder::expire_at` is an absolute time in ns (`0` = never). The candidate implements `expire(now)`, which cancels every resting order with `0 < expire_at <= now` and returns how many it cancelled. The engine calls it every time its clock advances, so it's usually called with nothing due.
+
+**The trap:** the natural first move is to add `expire_at` to `Order`. The candidate file keeps the repo's `static_assert(sizeof(Order) == 32)`, so that no longer compiles. Watch whether they remove the assert (a red flag: it's their own design decision) or store the expiry elsewhere. Ask why the assert exists: two orders per cache line during matching.
+
+**Approaches, from weak to strong:**
+- **Scan all slots on every `expire`:** O(arena) on every clock tick, even when nothing is due. Also runs into the same liveness problem as the Part 3 scan.
+- **Min-heap of `(expire_at, slot, gen)` (`solution.cpp`):** O(1) when nothing is due, O(log n) per order scheduled. Entries aren't removed when an order fills or is cancelled; they're skipped when they reach the top because the gen no longer matches. **Storing the gen in the entry is essential**: the test *"a reused slot does not inherit the old expiry"* fails if the entry holds only the slot, because the slot gets reused by an order that never expires. We checked this: slot-only tracking fails exactly that test.
+- Strong candidates raise the cost of skipping stale entries later: a cancelled order with an expiry far in the future leaves its heap entry behind, so under heavy cancel churn the heap can grow well past the number of live orders. Fixes: an **indexed heap** (store each slot's heap position and remove it on fill/cancel, O(log n)), rebuilding the heap when stale entries exceed half, or a **timing wheel** (buckets per ms/second, O(1) insert/remove, good when many orders share an expiry like end of day).
+- `std::priority_queue` allocates as it grows. Ask how they'd keep it off the hot path: reserve capacity up front, or a fixed-size heap over the arena.
+
+**Follow-ups (the key design questions):**
+- **Where does `now` come from?** If each shard reads its own clock, replaying the same input can expire different orders, so the result is not deterministic. Better: the gateway/sequencer puts a timestamp or timer message on the inbound ring, so expiry happens at a defined point in the message stream and replays match.
+- **Can an order trade after its expiry time?** Between clock updates, an order whose time has passed can still be matched. Options: call `expire(msg_time)` before processing every message, or have `match` check and skip expired resting orders on the way. Ask them to pick one and explain the cost.
+- **Should an order that is already expired when it arrives be accepted?** No: reject it (`expire_at <= now`) instead of letting it rest for one tick.
+- **Notifications:** each expiry should send the owner an unsolicited cancel message through the outbound ring, like `cancel_all` does.
+- `DAY` orders are the special case where almost every order shares one expiry time; a separate list per session end is O(1) per order and beats the heap.
+
 ## Scoring
 
 | | Strong hire | Hire | No hire |
@@ -105,4 +125,5 @@ Test: **`OPTIONAL: large sweep never leaves a crossed book`**. 100 resting asks 
 | Part 2 | Correct, keeps `total_qty` in sync, validates first | Correct after a test failure | Loses priority or skips ownership |
 | Part 3 | Per-account list in side arrays, unlinks on fill, explains the liveness bug the scan exposes | Working scan with a live check, can describe the O(account) version | Scan that crashes / can't explain why |
 | Part 4 | Finds the never-allocated-slot bug | Understands it once shown | — |
-| Optional | Finds the crossed book fast, streams fills, discusses backpressure | Finds it with a hint, safe fix | Raises the constant / misses the crossed book |
+| Optional A | Finds the crossed book fast, streams fills, discusses backpressure | Finds it with a hint, safe fix | Raises the constant / misses the crossed book |
+| Optional B | Keeps the 32-byte `Order`, heap with gen (or wheel), raises stale-entry growth and clock determinism | Working heap/sorted structure after a hint about slot reuse | Removes the `static_assert`, or scans the arena every tick |

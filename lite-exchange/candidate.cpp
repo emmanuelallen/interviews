@@ -12,8 +12,10 @@
 //  PART 1    Walk us through the code (no changes needed).
 //  PART 2    Implement reduce_order() and cancel ownership checks (see the TODOs).
 //  PART 3    Implement cancel_all() for an account (see the TODO).
-//  OPTIONAL  The "OPTIONAL" test in main() fails. Your interviewer will say
-//            whether to look at it. If so, find the cause and fix it.
+//  OPTIONAL  Your interviewer will say whether to look at these. Until then,
+//            ignore any test whose name starts with OPTIONAL.
+//    A       The "OPTIONAL A" test fails. Find the cause and fix it.
+//    B       Implement expire() for orders with arbitrary expiry times.
 //
 //  For this exercise an account is identified by its session_id.
 // =============================================================================
@@ -37,6 +39,7 @@ struct NewOrder
   uint32_t    qty;
   Side        side;
   TimeInForce tif;
+  uint64_t    expire_at = 0;  // absolute time in ns; 0 = never expires
 };
 
 struct Fill
@@ -61,6 +64,7 @@ struct Order
   Side        side;
   TimeInForce tif;
 };
+static_assert(sizeof(Order) == 32);  // as in your repo: two orders per cache line
 
 template <typename T, uint32_t N>
 class Pool
@@ -343,6 +347,17 @@ class OrderBook
     (void)session_id;
     return 0;  // TODO(part 3)
   }
+
+  // ------------------------------------------------------ OPTIONAL B TODO
+  // Orders can carry an arbitrary expiry time (NewOrder::expire_at, in ns;
+  // 0 = never). The engine calls expire(now) whenever its clock advances.
+  // Cancel every resting order with 0 < expire_at <= now and return how many.
+  // expire() may be called very often, and usually has nothing to do.
+  uint32_t expire(uint64_t now)
+  {
+    (void)now;
+    return 0;  // TODO(optional B)
+  }
   // --------------------------------------------------------------------------
 
   int64_t best_bid_price() const
@@ -469,9 +484,9 @@ struct Result
 
 // Change this helper if you change add_order's signature.
 static Result submit(Book& b, uint32_t session, uint64_t id, Side side, int64_t px, uint32_t qty,
-                     TimeInForce tif = TimeInForce::GTC)
+                     TimeInForce tif = TimeInForce::GTC, uint64_t expire_at = 0)
 {
-  NewOrder m{session, id, px, qty, side, tif};
+  NewOrder m{session, id, px, qty, side, tif, expire_at};
   Fill     buf[kMaxFills];
   uint32_t n = 0;
   Result   r;
@@ -645,8 +660,8 @@ int main()
     CHECK(b->best_bid_price() == 100);
   });
 
-  // ------------------------------------------------------------ OPTIONAL
-  run("OPTIONAL: large sweep never leaves a crossed book", [] {
+  // ------------------------------------------------------------ OPTIONAL A
+  run("OPTIONAL A: large sweep never leaves a crossed book", [] {
     auto b = std::make_unique<Book>(0, 1);
     for (uint64_t i = 0; i < 100; ++i)
       submit(*b, 1, 1000 + i, Side::SELL, 100, 1);
@@ -657,6 +672,64 @@ int main()
       filled += f.qty;
     CHECK(b->best_bid_price() < b->best_ask_price());  // book must never be crossed
     CHECK(filled == 100);
+  });
+
+  // ------------------------------------------------------------ OPTIONAL B
+  run("OPTIONAL B: expire removes exactly the orders that are due", [] {
+    auto b = std::make_unique<Book>(0, 1);
+    submit(*b, A, 1, Side::BUY, 100, 10, TimeInForce::GTC, /*expire_at=*/10);
+    submit(*b, A, 2, Side::BUY, 99, 10, TimeInForce::GTC, 20);
+    submit(*b, A, 3, Side::BUY, 98, 10);  // expire_at = 0: never expires
+    CHECK(b->expire(10) == 1);
+    CHECK(b->best_bid_price() == 99);
+    CHECK(b->expire(15) == 0);
+    CHECK(b->expire(20) == 1);
+    CHECK(b->best_bid_price() == 98);
+    CHECK(b->expire(UINT64_MAX) == 0);
+    CHECK(b->best_bid_price() == 98);
+  });
+
+  run("OPTIONAL B: expiries inserted out of order", [] {
+    auto     b = std::make_unique<Book>(0, 1);
+    uint64_t exp[] = {50, 10, 30, 10, 40};
+    for (uint64_t i = 0; i < 5; ++i)
+      submit(*b, A, i, Side::SELL, 100 + int64_t(i), 1, TimeInForce::GTC, exp[i]);
+    CHECK(b->expire(30) == 3);
+    CHECK(b->best_ask_price() == 100);  // exp 50
+    CHECK(b->live_orders() == 2);
+    CHECK(b->expire(50) == 2);
+    CHECK(b->best_ask_price() == INT64_MAX);
+  });
+
+  run("OPTIONAL B: filled or cancelled orders are not expired again", [] {
+    auto b = std::make_unique<Book>(0, 1);
+    submit(*b, A, 1, Side::SELL, 100, 5, TimeInForce::GTC, 10);
+    uint64_t t = submit(*b, A, 2, Side::SELL, 101, 5, TimeInForce::GTC, 10).handle.to_token();
+    submit(*b, A, 3, Side::SELL, 102, 5, TimeInForce::GTC, 10);
+    submit(*b, B, 4, Side::BUY, 100, 5);  // fills order 1
+    CHECK(b->cancel_by_token(t));         // cancels order 2
+    CHECK(b->expire(10) == 1);            // only order 3
+    CHECK(b->live_orders() == 0);
+  });
+
+  run("OPTIONAL B: partially filled orders still expire", [] {
+    auto b = std::make_unique<Book>(0, 1);
+    submit(*b, A, 1, Side::SELL, 100, 10, TimeInForce::GTC, 10);
+    submit(*b, B, 2, Side::BUY, 100, 4);
+    CHECK(b->expire(10) == 1);
+    CHECK(b->best_ask_price() == INT64_MAX);
+  });
+
+  run("OPTIONAL B: a reused slot does not inherit the old expiry", [] {
+    auto b = std::make_unique<Book>(0, 1);
+    submit(*b, A, 1, Side::SELL, 100, 5, TimeInForce::GTC, 10);
+    submit(*b, B, 2, Side::BUY, 100, 5);  // fills order 1, frees its slot
+    // New orders that never expire; one of them lands in order 1's old slot.
+    for (uint64_t i = 0; i < 4; ++i)
+      CHECK(submit(*b, A, 10 + i, Side::SELL, 101, 1).handle.valid());
+    CHECK(b->expire(10) == 0);
+    CHECK(b->best_ask_price() == 101);
+    CHECK(b->qty_at(Side::SELL, 101) == 4);
   });
 
   std::printf("\n%s (%d failing)\n", g_failed ? "FAILURES" : "ALL PASS", g_failed);
