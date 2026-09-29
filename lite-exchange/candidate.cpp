@@ -9,9 +9,13 @@
 //
 //  Build: g++ -std=c++20 -O1 -g -fsanitize=address,undefined candidate.cpp
 //
-//  PART 1  Walk us through the code (no changes needed).
-//  PART 2  One of the tests in main() fails. Find the cause and fix it.
-//  PART 3  Implement reduce_order() and cancel ownership checks (see the TODOs).
+//  PART 1    Walk us through the code (no changes needed).
+//  PART 2    Implement reduce_order() and cancel ownership checks (see the TODOs).
+//  PART 3    Implement cancel_all() for an account (see the TODO).
+//  OPTIONAL  The "OPTIONAL" test in main() fails. Your interviewer will say
+//            whether to look at it. If so, find the cause and fix it.
+//
+//  For this exercise an account is identified by its session_id.
 // =============================================================================
 #include <algorithm>
 #include <cassert>
@@ -310,11 +314,11 @@ class OrderBook
 
   bool cancel_by_token(uint64_t token) { return cancel_order(OrderHandle::from_token(token)); }
 
-  // ------------------------------------------------------------ PART 3 TODOs
+  // ------------------------------------------------------------ PART 2 TODOs
   // Cancel is only allowed for the session that entered the order.
   bool cancel_by_token(uint64_t token, uint32_t session_id)
   {
-    (void)session_id;  // TODO(part 3): enforce ownership
+    (void)session_id;  // TODO(part 2): enforce ownership
     return cancel_by_token(token);
   }
 
@@ -326,7 +330,18 @@ class OrderBook
   bool reduce_order(uint64_t token, uint32_t session_id, uint32_t new_qty)
   {
     (void)token, (void)session_id, (void)new_qty;
-    return false;  // TODO(part 3)
+    return false;  // TODO(part 2)
+  }
+
+  // ------------------------------------------------------------ PART 3 TODO
+  // Cancel every resting order belonging to session_id (both sides, all
+  // price levels). Returns the number of orders cancelled.
+  // Think about: what does this cost with 1M resting orders in the arena and
+  // an account that has 3 of them? This runs when a client disconnects.
+  uint32_t cancel_all(uint32_t session_id)
+  {
+    (void)session_id;
+    return 0;  // TODO(part 3)
   }
   // --------------------------------------------------------------------------
 
@@ -538,21 +553,7 @@ int main()
   });
 
   // ------------------------------------------------------------ PART 2
-  run("PART 2: large sweep never leaves a crossed book", [] {
-    auto b = std::make_unique<Book>(0, 1);
-    for (uint64_t i = 0; i < 100; ++i)
-      submit(*b, 1, 1000 + i, Side::SELL, 100, 1);
-    auto r = submit(*b, 2, 1, Side::BUY, 100, 100);
-
-    uint32_t filled = 0;
-    for (auto& f : r.fills)
-      filled += f.qty;
-    CHECK(b->best_bid_price() < b->best_ask_price());  // book must never be crossed
-    CHECK(filled == 100);
-  });
-
-  // ------------------------------------------------------------ PART 3
-  run("PART 3: reduce keeps time priority", [] {
+  run("PART 2: reduce keeps time priority", [] {
     auto     b = std::make_unique<Book>(0, 1);
     uint64_t t1 = submit(*b, A, 1, Side::SELL, 100, 10).handle.to_token();
     submit(*b, A, 2, Side::SELL, 100, 10);
@@ -564,7 +565,7 @@ int main()
     CHECK(r.fills.size() == 2 && r.fills[1].resting_id == 2 && r.fills[1].qty == 2);
   });
 
-  run("PART 3: reduce to zero removes the order", [] {
+  run("PART 2: reduce to zero removes the order", [] {
     auto     b = std::make_unique<Book>(0, 1);
     uint64_t t = submit(*b, A, 1, Side::BUY, 100, 10).handle.to_token();
     CHECK(b->reduce_order(t, A, 0));
@@ -572,7 +573,7 @@ int main()
     CHECK(b->live_orders() == 0);
   });
 
-  run("PART 3: reduce cannot increase or keep qty", [] {
+  run("PART 2: reduce cannot increase or keep qty", [] {
     auto     b = std::make_unique<Book>(0, 1);
     uint64_t t = submit(*b, A, 1, Side::BUY, 100, 10).handle.to_token();
     CHECK(!b->reduce_order(t, A, 10));
@@ -580,13 +581,82 @@ int main()
     CHECK(b->qty_at(Side::BUY, 100) == 10);
   });
 
-  run("PART 3: other sessions cannot reduce or cancel", [] {
+  run("PART 2: other sessions cannot reduce or cancel", [] {
     auto     b = std::make_unique<Book>(0, 1);
     uint64_t t = submit(*b, A, 1, Side::BUY, 100, 10).handle.to_token();
     CHECK(!b->reduce_order(t, B, 5));
     CHECK(!b->cancel_by_token(t, B));
     CHECK(b->qty_at(Side::BUY, 100) == 10);
     CHECK(b->cancel_by_token(t, A));
+  });
+
+  // ------------------------------------------------------------ PART 3
+  run("PART 3: cancel_all removes only that account's orders", [] {
+    auto b = std::make_unique<Book>(0, 1);
+    submit(*b, A, 1, Side::BUY, 100, 10);
+    submit(*b, A, 2, Side::BUY, 99, 5);
+    submit(*b, B, 3, Side::BUY, 99, 4);
+    submit(*b, A, 4, Side::SELL, 105, 7);
+    submit(*b, A, 5, Side::SELL, 106, 3);
+    submit(*b, B, 6, Side::SELL, 106, 2);
+    CHECK(b->cancel_all(A) == 4);
+    CHECK(b->best_bid_price() == 99);
+    CHECK(b->qty_at(Side::BUY, 99) == 4);
+    CHECK(b->best_ask_price() == 106);
+    CHECK(b->qty_at(Side::SELL, 106) == 2);
+    CHECK(b->live_orders() == 2);
+  });
+
+  run("PART 3: cancel_all skips orders already filled or cancelled", [] {
+    auto b = std::make_unique<Book>(0, 1);
+    submit(*b, A, 1, Side::SELL, 100, 5);
+    uint64_t t = submit(*b, A, 2, Side::SELL, 101, 5).handle.to_token();
+    submit(*b, A, 3, Side::SELL, 102, 5);
+    submit(*b, B, 4, Side::BUY, 100, 5);  // fills order 1
+    CHECK(b->cancel_by_token(t, A));      // cancels order 2
+    CHECK(b->cancel_all(A) == 1);         // only order 3 is left
+    CHECK(b->best_ask_price() == INT64_MAX);
+    CHECK(b->live_orders() == 0);
+  });
+
+  run("PART 3: cancel_all includes partially filled orders", [] {
+    auto b = std::make_unique<Book>(0, 1);
+    submit(*b, A, 1, Side::SELL, 100, 10);
+    submit(*b, B, 2, Side::BUY, 100, 4);
+    CHECK(b->cancel_all(A) == 1);
+    CHECK(b->best_ask_price() == INT64_MAX);
+  });
+
+  run("PART 3: tokens are dead after cancel_all; account can trade again", [] {
+    auto     b = std::make_unique<Book>(0, 1);
+    uint64_t t = submit(*b, A, 1, Side::BUY, 100, 10).handle.to_token();
+    CHECK(b->cancel_all(A) == 1);
+    CHECK(!b->cancel_by_token(t, A));
+    CHECK(submit(*b, A, 2, Side::BUY, 101, 1).handle.valid());
+    CHECK(b->best_bid_price() == 101);
+    CHECK(b->cancel_all(A) == 1);
+    CHECK(b->cancel_all(A) == 0);
+  });
+
+  run("PART 3: cancel_all for an account with no orders is a no-op", [] {
+    auto b = std::make_unique<Book>(0, 1);
+    submit(*b, A, 1, Side::BUY, 100, 10);
+    CHECK(b->cancel_all(B) == 0);
+    CHECK(b->best_bid_price() == 100);
+  });
+
+  // ------------------------------------------------------------ OPTIONAL
+  run("OPTIONAL: large sweep never leaves a crossed book", [] {
+    auto b = std::make_unique<Book>(0, 1);
+    for (uint64_t i = 0; i < 100; ++i)
+      submit(*b, 1, 1000 + i, Side::SELL, 100, 1);
+    auto r = submit(*b, 2, 1, Side::BUY, 100, 100);
+
+    uint32_t filled = 0;
+    for (auto& f : r.fills)
+      filled += f.qty;
+    CHECK(b->best_bid_price() < b->best_ask_price());  // book must never be crossed
+    CHECK(filled == 100);
   });
 
   std::printf("\n%s (%d failing)\n", g_failed ? "FAILURES" : "ALL PASS", g_failed);
