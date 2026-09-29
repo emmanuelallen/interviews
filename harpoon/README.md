@@ -91,8 +91,7 @@ Probe: *"Test 5 and test 6 feed 64-byte chunks. Why does that matter?"*
 
 ## Discussion questions (remaining time, pick any)
 
-These are real issues in the candidate's repo (file:line references are from
-their `main` branch):
+These are real issues in the candidate's repo (`main` branch):
 
 1. **ODR / "header-only" claim.** `dispatch_field` in `harpoon/dispatch.h`
    is a non-`inline`, non-template function defined in a header. Including
