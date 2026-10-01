@@ -151,9 +151,7 @@ class Shard
         order, [&](const proto::Fill& f) { emit_fill(f, session_id); });
 
     if (h.valid())  // resting order: Ack carries the cancel token
-    {
       emit_ack(order.order_id, h.to_token(shard_id_), session_id);
-    }
   }
 
   void handle_cancel(const proto::CancelOrder& cancel, uint32_t session_id)
@@ -251,7 +249,6 @@ class Shard
   book::Pool<book::Order, CFG.max_orders>        pool_;
   uint32_t                                       order_session_[CFG.max_orders]{};
   book::AccountIndex<CFG.max_orders>             accounts_;  // SOLUTION (part 3)
-
   std::array<Book, CFG.max_symbols>              books_;
   uint16_t                                       local_of_[SYMBOL_SPACE];
   SpscQueue<proto::InboundMsg, CFG.queue_depth>  inbound_;

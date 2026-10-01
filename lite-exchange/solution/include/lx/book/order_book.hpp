@@ -130,7 +130,8 @@ class OrderBook
 
   bool cancel_order(OrderHandle h)
   {
-    if (!is_resting(h))
+    // SOLUTION (bonus): live as well as gen, so a token for a free slot can't pass.
+    if (h.slot >= MAX_ORDERS || !pool_.live(h.slot) || pool_.gen(h.slot) != h.gen)
       return false;
 
     Order&   o = pool_[h.slot];
@@ -164,15 +165,6 @@ class OrderBook
   }
 
   bool cancel_by_token(uint64_t token) { return cancel_order(OrderHandle::from_token(token)); }
-
-  // Slot in range, allocated, and the same allocation the handle was issued
-  // for. Every allocated slot is resting: aggressors are freed before
-  // add_order returns.
-  bool is_resting(OrderHandle h) const
-  {
-    return h.slot < MAX_ORDERS && pool_.live(h.slot) && pool_.gen(h.slot) == h.gen;
-  }
-
 
   int64_t best_bid_price() const
   {
