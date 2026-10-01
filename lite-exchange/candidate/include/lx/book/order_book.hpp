@@ -142,30 +142,6 @@ class OrderBook
 
   bool cancel_by_token(uint64_t token) { return cancel_order(OrderHandle::from_token(token)); }
 
-  // EXERCISE (part 2) -------------------------------------------------------
-  // Reduce a resting order's open quantity to new_qty WITHOUT losing its time
-  // priority in the level's FIFO.
-  //   - new_qty must be strictly less than the current open qty
-  //   - new_qty == 0 behaves like cancel_order
-  // Returns true on success, false if rejected (including a stale handle).
-  bool reduce_order(OrderHandle h, uint32_t new_qty)
-  {
-    (void)h;
-    (void)new_qty;
-    return false;  // TODO(part 2)
-  }
-
-  // EXERCISE: aggregate open qty resting at a price (what market data would
-  // publish). Reads PriceLevel::total_qty.
-  uint32_t level_qty(proto::Side side, int64_t price) const
-  {
-    int32_t idx = price_to_idx(price);
-    if (idx < 0 || static_cast<uint32_t>(idx) >= LADDER_SIZE)
-      return 0;
-    return side == proto::Side::BUY ? bid_levels_[idx].total_qty : ask_levels_[idx].total_qty;
-  }
-  // -------------------------------------------------------------------------
-
   int64_t best_bid_price() const
   {
     if (best_bid_idx_ == NULL_IDX)

@@ -92,9 +92,6 @@ class Shard
       case proto::MsgType::MASS_CANCEL:  // EXERCISE (part 3)
         handle_mass_cancel(session_id);
         break;
-      case proto::MsgType::TIMER:  // EXERCISE (optional B)
-        handle_timer(msg.timer.now_ns);
-        break;
       default:
         break;  // unknown type: drop
     }
@@ -194,15 +191,6 @@ class Shard
   void handle_mass_cancel(uint32_t session_id)
   {
     (void)session_id;  // TODO(part 3)
-  }
-
-  // EXERCISE (optional B) ---------------------------------------------------
-  // Cancel every resting order with 0 < expire_at <= now_ns. Emit one ACK per
-  // expired order to its owner, carrying its order_id and cancel token.
-  // TIMER arrives often and usually has nothing to expire.
-  void handle_timer(uint64_t now_ns)
-  {
-    (void)now_ns;  // TODO(optional B)
   }
   // -------------------------------------------------------------------------
 

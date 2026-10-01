@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build and run the tests.
-#   ./run.sh                    everything except the OPTIONAL parts
+#   ./run.sh                    everything except the OPTIONAL part
 #   ./run.sh 'Part2*'           one part (any --gtest_filter pattern)
 #   ./run.sh '*'                everything
 set -euo pipefail

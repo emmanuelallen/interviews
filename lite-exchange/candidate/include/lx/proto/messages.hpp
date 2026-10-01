@@ -10,8 +10,7 @@ enum class MsgType : uint8_t
   LOGON = 0x01,
   NEW_ORDER = 0x02,
   CANCEL_ORDER = 0x03,
-  MASS_CANCEL = 0x04,  // EXERCISE (part 3): cancel all of the sender's orders
-  TIMER = 0x05,        // EXERCISE (optional B): engine clock tick
+  MASS_CANCEL = 0x04,  // EXERCISE: cancel all of the sender's orders
   ACK = 0x81,
   REJECT = 0x82,
   FILL = 0x83,
@@ -63,7 +62,6 @@ struct NewOrder
   uint16_t    symbol_id;
   Side        side;
   TimeInForce tif;
-  uint64_t    expire_at;  // EXERCISE (optional B): absolute ns; 0 = never expires
 };
 
 struct CancelOrder
@@ -77,14 +75,6 @@ struct MassCancel
 {
   Header   hdr;
   uint64_t padding;
-};
-
-// EXERCISE (optional B). Engine-internal: the sequencer injects one whenever
-// the engine clock advances, so expiry happens at a defined point in the stream.
-struct Timer
-{
-  Header   hdr;
-  uint64_t now_ns;
 };
 
 struct Ack
@@ -120,7 +110,6 @@ union InboundMsg
   NewOrder    new_order;
   CancelOrder cancel;
   MassCancel  mass_cancel;  // EXERCISE
-  Timer       timer;        // EXERCISE
 };
 
 union OutboundMsg
@@ -134,9 +123,8 @@ union OutboundMsg
 // ---- Compile-time layout verification ----
 static_assert(sizeof(Header) == 8);
 static_assert(sizeof(Logon) == 16);
-static_assert(sizeof(NewOrder) == 40);  // EXERCISE: was 32 before expire_at
+static_assert(sizeof(NewOrder) == 32);
 static_assert(sizeof(MassCancel) == 16);
-static_assert(sizeof(Timer) == 16);
 static_assert(sizeof(CancelOrder) == 16);
 static_assert(sizeof(Ack) == 24);
 static_assert(sizeof(Reject) == 24);

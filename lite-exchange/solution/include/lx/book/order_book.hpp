@@ -56,7 +56,7 @@ class OrderBook
   }
 
   // Valid handle if the order rests; invalid if filled or rejected.
-  // SOLUTION (optional A): fills go to a sink as they happen, so matching
+  // SOLUTION (optional): fills go to a sink as they happen, so matching
   // always runs to completion and can never leave the book crossed. The shard
   // passes emit_fill (-> outbound ring).
   template <typename Sink>
@@ -165,31 +165,6 @@ class OrderBook
 
   bool cancel_by_token(uint64_t token) { return cancel_order(OrderHandle::from_token(token)); }
 
-  // EXERCISE (part 2) -------------------------------------------------------
-  // Reduce a resting order's open quantity to new_qty WITHOUT losing its time
-  // priority in the level's FIFO.
-  //   - new_qty must be strictly less than the current open qty
-  //   - new_qty == 0 behaves like cancel_order
-  // Returns true on success, false if rejected (including a stale handle).
-  bool reduce_order(OrderHandle h, uint32_t new_qty)
-  {
-    if (!is_resting(h))
-      return false;
-    Order& o = pool_[h.slot];
-    if (new_qty >= o.qty)
-      return false;  // an increase must lose priority: that's cancel/replace
-    if (new_qty == 0)
-      return cancel_order(h);
-
-    // In place: the order keeps its FIFO position. Only the level aggregate
-    // has to follow, or level_qty / market data drifts.
-    uint32_t    uidx = static_cast<uint32_t>(price_to_idx(o.price));
-    PriceLevel& level = (o.side == proto::Side::BUY ? bid_levels_[uidx] : ask_levels_[uidx]);
-    level.total_qty -= o.qty - new_qty;
-    o.qty = new_qty;
-    return true;
-  }
-
   // Slot in range, allocated, and the same allocation the handle was issued
   // for. Every allocated slot is resting: aggressors are freed before
   // add_order returns.
@@ -198,16 +173,6 @@ class OrderBook
     return h.slot < MAX_ORDERS && pool_.live(h.slot) && pool_.gen(h.slot) == h.gen;
   }
 
-  // EXERCISE: aggregate open qty resting at a price (what market data would
-  // publish). Reads PriceLevel::total_qty.
-  uint32_t level_qty(proto::Side side, int64_t price) const
-  {
-    int32_t idx = price_to_idx(price);
-    if (idx < 0 || static_cast<uint32_t>(idx) >= LADDER_SIZE)
-      return 0;
-    return side == proto::Side::BUY ? bid_levels_[idx].total_qty : ask_levels_[idx].total_qty;
-  }
-  // -------------------------------------------------------------------------
 
   int64_t best_bid_price() const
   {

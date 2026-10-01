@@ -1,9 +1,9 @@
-// OPTIONAL A: this test fails against the code as shipped. Find out why.
+// OPTIONAL: this test fails against the code as shipped. Find out why.
 #include "exercise_util.hpp"
 
 using namespace ex;
 
-TEST(OptionalA, LargeSweepNeverLeavesACrossedBook)
+TEST(Optional, LargeSweepNeverLeavesACrossedBook)
 {
   ExShard shard{BASE, 1};
   for (uint64_t i = 0; i < 100; ++i)

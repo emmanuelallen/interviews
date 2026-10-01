@@ -12,18 +12,19 @@ The exercise is a **trimmed copy of their repo**, with the same layout, headers,
 ### How close is it to their repo?
 
 Checked file by file against their latest commit (`5fb8b77`):
-- **Identical:** `util/huge_page.hpp`, `util/cache.hpp`, `queue/spsc.hpp`, `book/order.hpp`, `book/pool.hpp`, `book/price_level.hpp`, `book/level_bitmap.hpp`, `engine/shard_router.hpp`, and 6 of their test files: `book_test`, `level_bitmap_test`, `engine_test`, `shard_symbols_test`, `shard_router_test`, `spsc_test`. Their 44 tests pass.
+- **Identical:** `util/huge_page.hpp`, `util/cache.hpp`, `queue/spsc.hpp`, `book/order.hpp`, `book/pool.hpp`, `book/price_level.hpp`, `book/level_bitmap.hpp`, `book/order_book.hpp`, `engine/shard_router.hpp`, and 6 of their test files: `book_test`, `level_bitmap_test`, `engine_test`, `shard_symbols_test`, `shard_router_test`, `spsc_test`. Their 44 tests pass.
 - **Additions only, marked `EXERCISE`:**
-  - `proto/messages.hpp`: `MASS_CANCEL` and `TIMER` messages, and `NewOrder::expire_at`. The size assert changes from 32 to 40; this is the only line removed anywhere.
-  - `book/order_book.hpp`: the `reduce_order` stub and a `level_qty` accessor.
-  - `engine/shard.hpp`: two `switch` cases, a TODO, and two stubs.
+  - `proto/messages.hpp` (+10 lines): a `MASS_CANCEL` message type and its 16-byte struct.
+  - `engine/shard.hpp` (+18 lines): one `switch` case, the Part 2 TODO comment, and the `handle_mass_cancel` stub.
+
+  No line of their code is changed or removed; the diff against their repo is additions only.
 - **Left out:** the gateway/net layer, `ShardSet`, benchmarks and liburing. `CMakeLists.txt` is their root file minus those dependencies.
 
 ### Setting up the pad
 
 1. Create a CoderPad **project** (multi-file) using C++, and upload the contents of `candidate/`.
-2. Set the run command to `./run.sh`. This runs everything except the optional parts. `./run.sh 'Part2*'` runs one part, and `./run.sh '*'` runs everything.
-3. Run it once before the interview. Expect 55 tests to run: 47 pass (their 44, plus 3 exercise tests that already pass against the stubs) and 8 Part 2/3 tests fail. `./run.sh '*'` adds the 6 optional tests, and 5 of those fail too. The solution passes all 63 (`./run.sh '*'` in `solution/`, which includes 2 bonus tests).
+2. Set the run command to `./run.sh`. This runs everything except the optional part. `./run.sh 'Part2*'` runs one part, and `./run.sh '*'` runs everything.
+3. Run it once before the interview. Expect 51 tests to run: 45 pass (their 44, plus 1 exercise test that already passes against the stub) and 6 Part 2/3 tests fail. `./run.sh '*'` adds the optional test, which fails too. The solution passes all 54 (`./run.sh '*'` in `solution/`, which includes 2 bonus tests).
 
 `run.sh` uses CMake if it's installed, and otherwise calls `g++` directly. It uses real GoogleTest if available, and otherwise a small shim in `third_party/mini_gtest`. Both paths were tested here (g++ 13, no GoogleTest installed). **I couldn't check CoderPad's C++ image itself.** It needs a compiler with `-std=c++23` (g++ 11+ or clang 14+); do a dry run first.
 
@@ -32,13 +33,12 @@ Checked file by file against their latest commit (`5fb8b77`):
 | Min | Part |
 |---|---|
 | 0–10 | Part 1: walkthrough of their design |
-| 10–25 | Part 2: `reduce_order` + cancel ownership |
-| 25–45 | Part 3: mass cancel for an account |
+| 10–20 | Part 2: cancel ownership |
+| 20–45 | Part 3: mass cancel for an account |
 | 45–60 | Part 4: discussion / bonus bug |
-| *if time* | **Optional A:** debug the crossed book |
-| *if time* | **Optional B:** support arbitrary order expiry times |
+| *if time* | **Optional:** debug the crossed book |
 
-Use an optional part in place of Part 4, or for a strong candidate who finishes early. Optional A is debugging; Optional B is design plus implementation, and follows naturally from Part 3. `./run.sh` skips the optional tests by default.
+Use the optional part in place of Part 4, or for a strong candidate who finishes early. `./run.sh` skips the optional test by default.
 
 ---
 
@@ -51,23 +51,17 @@ Ask them to explain, pointing at the code:
 3. **Why is `total_qty -= o.qty` in `PriceLevel::pop_front` correct during matching, when `match` already subtracted `fill_qty`?** By the time `pop_front` runs, `resting.qty == 0`, so it subtracts 0. This checks whether they understand the invariant or just wrote it.
 4. **Why are books templated on `MAX_ORDERS` / `LADDER_SIZE`?** Fixed layout, no allocation on the hot path. Follow-up: *"What's the largest `max_orders` the token supports?"* The answer is 2^24, because the slot has 24 bits. There's no `static_assert`, so a larger arena would make tokens silently point at the wrong slot.
 
-## Part 2: `reduce_order` + ownership (15 min)
+## Part 2: Cancel ownership (10 min)
 
-Tests: `test/exercise/part2_test.cc`.
-- **`OrderBook::reduce_order(OrderHandle, new_qty)`:** reduce in place **without losing time priority**. `new_qty == 0` works like a cancel; `new_qty >= qty` and stale handles are rejected.
-- **Ownership in `Shard::handle_cancel`:** only the session that entered an order may cancel it. Their repo has no such check.
+Test: `test/exercise/part2_test.cc`. In `Shard::handle_cancel`, only the session that entered an order may cancel it. Their repo has no such check. This is a short warm-up for Part 3, which works in the same file with the same data.
 
 **What to look for:**
-- They update **`level.total_qty`** as well as `o.qty`. Test `ReduceKeepsTimePriority` checks `level_qty == 14`. Missing this is the most common bug; `level_qty` is the only reader of `total_qty`, which is what market data would publish.
-- They don't unlink and re-link the order, which would lose priority. They can explain why an *increase* must lose priority: it's unfair to orders queued behind it.
-- For ownership they reuse `order_session_[slot]`, which already exists for routing passive fills, and they check it **after** validating slot + gen, as the existing comment in `handle_cancel` says.
+- They reuse `order_session_[slot]`, which already exists for routing passive fills, and they check it **after** validating slot + gen, as the existing comment in `handle_cancel` says.
 - **Strong signal:** they reject a cancel from the wrong owner with the same `UNKNOWN_ORDER` as a bad token, so a probe can't learn that someone else's order exists.
 
 **Why ownership matters:** tokens are `slot | gen << 24`, and early in the day most slots are at gen 0, so another firm's tokens are easy to guess. Ask whether they consider the missing check a security bug (yes).
 
-**Follow-up:** "How would a reduce request reach the book?" It needs a new message type, a case in `Shard::tick`, and routing in `ShardRouter::push`. The router routes cancels by the shard bits in the token, and a reduce would work the same way.
-
-## Part 3: Mass cancel for an account (20 min)
+## Part 3: Mass cancel for an account (25 min)
 
 Tests: `test/exercise/part3_test.cc`. Implement `Shard::handle_mass_cancel(session_id)`: cancel every resting order the account has **on any book on this shard**, and ACK each one with its `order_id` and token. Real venues run this on **cancel-on-disconnect** and for risk kill switches. In this exercise an account is its `session_id`.
 
@@ -106,9 +100,9 @@ Yes. `Pool::free` increments `gen`, so a slot that was **never allocated** still
 - **SPSC queue.** The memory ordering is correct, but `push`/`pop` load the other side's atomic on every call, which moves that cache line between cores. Their own benchmark shows ring transit is 87% of latency. How would they reduce it? Cache the other side's index locally and reload only when the ring looks full or empty; batch pops.
 - **Gateway `send_all`** (in their repo, not this pad). On a non-blocking socket it gives up on `EAGAIN` partway through a frame, so a slow client gets a torn message and every later frame is misaligned.
 
-## Optional A: Debug the crossed book (15–20 min)
+## Optional: Debug the crossed book (15–20 min)
 
-Test: `OptionalA.LargeSweepNeverLeavesACrossedBook` (`./run.sh 'OptionalA*'`). Account A rests 100 asks of qty 1 @ 105, then account B buys 100 @ 105.
+Test: `Optional.LargeSweepNeverLeavesACrossedBook` (`./run.sh 'Optional*'`). Account A rests 100 asks of qty 1 @ 105, then account B buys 100 @ 105.
 
 **Root cause:** `Shard::handle_new` passes a 64-entry fill buffer (`MAX_FILLS_PER_ORDER`), and `match()` does `if (fill_count >= max_fills) return;`. Matching stops after 64 fills, then `add_order` sees `o.qty > 0` and **rests the leftover 36 as a bid at 105 while 36 asks at 105 are still on the book**. The book is crossed.
 
@@ -125,39 +119,12 @@ Test: `OptionalA.LargeSweepNeverLeavesACrossedBook` (`./run.sh 'OptionalA*'`). A
 
 **Follow-up:** the sink pushes into an SPSC ring that can be full, and `Shard::push_out` busy-spins, so one slow gateway stalls matching for every symbol on the shard. Discuss backpressure: reject new orders above a high-water mark, or size the rings for the worst burst.
 
-## Optional B: Arbitrary expiry times (20 min)
-
-Tests: `test/exercise/optional_b_test.cc` (`./run.sh 'OptionalB*'`). Their engine has only `GTC` (rests until filled or cancelled) and `IOC` (the leftover is dropped straight away), so orders never expire. This part adds good-till-time orders:
-- `NewOrder::expire_at` is an absolute time in ns; `0` means never.
-- A `TIMER` message carries the engine clock.
-- The candidate implements `Shard::handle_timer(now)`: cancel every resting order with `0 < expire_at <= now`, and ACK the owner of each.
-- TIMER arrives often and usually has nothing to do.
-
-**The trap:** the natural first move is to copy `expire_at` into `Order`, which breaks their own `static_assert(sizeof(Order) == 32)`. Watch whether they delete the assert (a red flag: it's their own design decision) or keep the expiry elsewhere.
-
-**Approaches, from weak to strong:**
-- **Scan the arena on every TIMER:** O(arena) per tick even when nothing is due, and it runs into the same liveness problem as the Part 3 scan.
-- **Min-heap of `(expire_at, slot, gen)` (`solution/`), owned by the shard:**
-  - O(1) when nothing is due, O(log n) per order scheduled.
-  - Entries aren't removed on fill or cancel; they're dropped when they reach the top because the gen no longer matches.
-  - **Storing the gen in the entry is essential.** `AReusedSlotDoesNotInheritTheOldExpiry` fails if the entry holds only the slot, because the slot gets reused by an order that never expires. We checked this: slot-only tracking fails exactly that test.
-- **Stronger still:** they notice that cancelled orders with far-off expiries leave entries behind, so the heap can grow well beyond the live order count. Fixes: an indexed heap (remove on fill/cancel), periodic rebuilds, or a timing wheel (O(1), good when many orders share an expiry, like end of day).
-- `std::priority_queue` allocates as it grows: reserve capacity up front, or use a fixed heap over the arena.
-
-**Follow-ups:**
-- **Why is `now` a message instead of `clock_gettime` in the shard?** Determinism: replaying the same input must expire the same orders at the same point in the stream. The sequencer/gateway stamps time onto the inbound ring.
-- **Can an order trade after its expiry, before the next TIMER?** Yes. Options: expire before processing every message, or have `match` skip expired resting orders. Ask them to pick one and explain the cost.
-- **An order already expired on arrival** should be rejected, not rested for one tick.
-- **Wire format:** adding `expire_at` grew `NewOrder` from 32 to 40 bytes, so every inbound ring slot grew too. Would they rather add a `GTT` time-in-force and a separate message, or accept the bigger slot?
-- **`DAY` orders** are the case where almost every order shares one expiry; one list per session end beats a heap.
-
 ## Scoring
 
 | | Strong hire | Hire | No hire |
 |---|---|---|---|
 | Part 1 | Explains the invariants, raises the 2^24 limit unprompted | Explains the design correctly | Can't explain their own token/bitmap |
-| Part 2 | Correct, keeps `total_qty` in sync, validates before reading, same reject for wrong owner | Correct after a test failure | Loses priority or skips ownership |
+| Part 2 | Checks after validating slot + gen, same reject for wrong owner, explains why guessable tokens make this a security bug | Correct after a test failure | Checks before validating the token, or can't say why it matters |
 | Part 3 | Shard-wide per-account list in side arrays, unlinks on fill, explains the liveness bug the scan exposes, spots the router drop | Working scan plus a live check, can describe the O(account) version | Scan that corrupts the pool / can't explain why |
 | Part 4 | Finds the never-allocated-slot bug | Understands it once shown | — |
-| Optional A | Finds the crossed book fast, streams fills, discusses backpressure | Finds it with a hint, safe fix | Raises the constant / misses the crossed book |
-| Optional B | Keeps the 32-byte `Order`, heap with gen (or wheel), raises stale-entry growth and determinism | Working heap/sorted structure after a hint about slot reuse | Deletes the `static_assert`, or scans the arena every tick |
+| Optional | Finds the crossed book fast, streams fills, discusses backpressure | Finds it with a hint, safe fix | Raises the constant / misses the crossed book |

@@ -4,7 +4,6 @@
 
 #include <vector>
 
-#include "lx/book/order_book.hpp"
 #include "lx/engine/shard.hpp"
 
 namespace ex
@@ -22,7 +21,7 @@ using ExShard = engine::Shard<EX_SHARD>;
 constexpr int64_t BASE = 100;
 
 inline InboundMsg in_new(uint32_t session, uint16_t symbol, uint64_t oid, Side side, int64_t price,
-                         uint32_t qty, TimeInForce tif = TimeInForce::GTC, uint64_t expire_at = 0)
+                         uint32_t qty, TimeInForce tif = TimeInForce::GTC)
 {
   InboundMsg m{};
   m.new_order.hdr = {sizeof(NewOrder), MsgType::NEW_ORDER, 0};
@@ -33,7 +32,6 @@ inline InboundMsg in_new(uint32_t session, uint16_t symbol, uint64_t oid, Side s
   m.new_order.qty = qty;
   m.new_order.side = side;
   m.new_order.tif = tif;
-  m.new_order.expire_at = expire_at;
   return m;
 }
 
@@ -51,14 +49,6 @@ inline InboundMsg in_mass_cancel(uint32_t session)
   InboundMsg m{};
   m.mass_cancel.hdr = {sizeof(MassCancel), MsgType::MASS_CANCEL, 0};
   m.mass_cancel.hdr.session_id = session;
-  return m;
-}
-
-inline InboundMsg in_timer(uint64_t now_ns)
-{
-  InboundMsg m{};
-  m.timer.hdr = {sizeof(Timer), MsgType::TIMER, 0};
-  m.timer.now_ns = now_ns;
   return m;
 }
 
@@ -87,36 +77,11 @@ inline std::vector<OutboundMsg> of(const std::vector<OutboundMsg>& out, MsgType 
 
 // Place an order expected to rest; returns its cancel token (0 if it didn't).
 inline uint64_t rest(ExShard& shard, uint32_t session, uint16_t symbol, uint64_t oid, Side side,
-                     int64_t price, uint32_t qty, uint64_t expire_at = 0)
+                     int64_t price, uint32_t qty)
 {
-  auto acks = of(send(shard, in_new(session, symbol, oid, side, price, qty, TimeInForce::GTC,
-                                    expire_at)),
-                 MsgType::ACK, session);
+  auto acks = of(send(shard, in_new(session, symbol, oid, side, price, qty)), MsgType::ACK, session);
   EXPECT_EQ(acks.size(), 1u);
   return acks.empty() ? 0 : acks[0].ack.order_token;
 }
 
-// A book with storage of its own, as in test/book/book_test.cc.
-template <uint32_t MAX_ORDERS>
-struct BookStorage
-{
-  book::Pool<book::Order, MAX_ORDERS> pool;
-  uint32_t                            order_session[MAX_ORDERS]{};
-};
-
-template <uint32_t MAX_ORDERS, uint32_t LADDER_SIZE>
-struct StandaloneBook : private BookStorage<MAX_ORDERS>,
-                        public book::OrderBook<MAX_ORDERS, LADDER_SIZE>
-{
-  StandaloneBook(int64_t base_price, int64_t tick_size)
-      : book::OrderBook<MAX_ORDERS, LADDER_SIZE>(base_price, tick_size, this->pool,
-                                                 this->order_session)
-  {
-  }
-};
-
-inline NewOrder book_order(uint64_t oid, Side side, int64_t price, uint32_t qty)
-{
-  return in_new(0, 0, oid, side, price, qty).new_order;
-}
 }  // namespace ex

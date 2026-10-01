@@ -3,11 +3,8 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
-#include <functional>
-#include <queue>
 #include <span>
 #include <utility>
-#include <vector>
 
 #include "lx/book/order_book.hpp"
 #include "lx/proto/messages.hpp"
@@ -94,9 +91,6 @@ class Shard
       case proto::MsgType::MASS_CANCEL:  // EXERCISE (part 3)
         handle_mass_cancel(session_id);
         break;
-      case proto::MsgType::TIMER:  // EXERCISE (optional B)
-        handle_timer(msg.timer.now_ns);
-        break;
       default:
         break;  // unknown type: drop
     }
@@ -152,15 +146,13 @@ class Shard
       return;
     }
 
-    // SOLUTION (optional A): no fixed fill buffer; each fill goes straight out.
+    // SOLUTION (optional): no fixed fill buffer; each fill goes straight out.
     book::OrderHandle h = books_[book].add_order(
         order, [&](const proto::Fill& f) { emit_fill(f, session_id); });
 
     if (h.valid())  // resting order: Ack carries the cancel token
     {
       emit_ack(order.order_id, h.to_token(shard_id_), session_id);
-      if (order.expire_at != 0)  // SOLUTION (optional B)
-        expiries_.push({order.expire_at, h.slot, h.gen});
     }
   }
 
@@ -201,41 +193,15 @@ class Shard
   {
     for (uint32_t slot = accounts_.first(session_id); slot != book::NULL_IDX;)
     {
-      uint32_t          next = accounts_.next(slot);
-      book::OrderHandle h{slot, pool_.gen(slot)};
-      cancel_and_ack(h, session_id);
+      uint32_t           next = accounts_.next(slot);
+      const book::Order& o = pool_[slot];
+      uint64_t           order_id = o.order_id;  // read before the slot is freed
+      uint16_t           book = local_book(o.symbol);
+      book::OrderHandle  h{slot, pool_.gen(slot)};
+      if (book != NO_BOOK && books_[book].cancel_order(h))
+        emit_ack(order_id, h.to_token(shard_id_), session_id);
       slot = next;
     }
-  }
-
-  // EXERCISE (optional B) ---------------------------------------------------
-  // Cancel every resting order with 0 < expire_at <= now_ns. Emit one ACK per
-  // expired order to its owner, carrying its order_id and cancel token.
-  // TIMER arrives often and usually has nothing to expire.
-  // SOLUTION: min-heap by expiry, O(1) when nothing is due. Entries aren't
-  // removed on fill/cancel; they carry the gen they were scheduled with and
-  // are dropped when they surface. That gen check is also what stops a reused
-  // slot from inheriting the previous order's expiry.
-  void handle_timer(uint64_t now_ns)
-  {
-    while (!expiries_.empty() && expiries_.top().at <= now_ns)
-    {
-      Expiry e = expiries_.top();
-      expiries_.pop();
-      book::OrderHandle h{e.slot, e.gen};
-      if (pool_.live(h.slot) && pool_.gen(h.slot) == h.gen)
-        cancel_and_ack(h, order_session_[h.slot]);
-    }
-  }
-
-  // Cancel a known-live order and ACK its owner with its order_id and token.
-  void cancel_and_ack(book::OrderHandle h, uint32_t owner)
-  {
-    const book::Order& o = pool_[h.slot];
-    uint64_t           order_id = o.order_id;  // read before the slot is freed
-    uint16_t           book = local_book(o.symbol);
-    if (book != NO_BOOK && books_[book].cancel_order(h))
-      emit_ack(order_id, h.to_token(shard_id_), owner);
   }
   // -------------------------------------------------------------------------
 
@@ -286,15 +252,6 @@ class Shard
   uint32_t                                       order_session_[CFG.max_orders]{};
   book::AccountIndex<CFG.max_orders>             accounts_;  // SOLUTION (part 3)
 
-  // SOLUTION (optional B). expire_at lives only here, not in Order (32 bytes).
-  struct Expiry
-  {
-    uint64_t at;
-    uint32_t slot;
-    uint32_t gen;
-    bool     operator>(const Expiry& o) const { return at > o.at; }
-  };
-  std::priority_queue<Expiry, std::vector<Expiry>, std::greater<>> expiries_;
   std::array<Book, CFG.max_symbols>              books_;
   uint16_t                                       local_of_[SYMBOL_SPACE];
   SpscQueue<proto::InboundMsg, CFG.queue_depth>  inbound_;
