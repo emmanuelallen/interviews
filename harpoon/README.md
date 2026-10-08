@@ -66,6 +66,41 @@ wall time is the median of 6 alternating runs on a shared cloud VM):
 
 The starter's ~5.7M msgs/s matches the 5.75M in their README.
 
+**Sample output.** This is from `./tests bench` on a VM without hardware
+counters. With counters, the `instructions:` line shows the count instead.
+
+```text
+starter$ ./tests bench
+
+[BENCH] fileparse.cc workload: 100000 messages, 22.0 MB, 4096-byte chunks, best of 5
+    5013 count: 100000 (expect 100000)  5013 average: 1.1250 (expect 1.1250)
+    instructions: unavailable (perf_event_open: No such file or directory). See the comment on feed_all for valgrind.
+    TSC ticks:    39271270  (392.7 / message)
+    wall time:    18.70 ms  (5.35 M msgs/s, 1.18 GB/s)
+
+solution$ ./tests bench
+
+[BENCH] fileparse.cc workload: 100000 messages, 22.0 MB, 4096-byte chunks, best of 5
+    5013 count: 100000 (expect 100000)  5013 average: 1.1250 (expect 1.1250)
+    instructions: unavailable (perf_event_open: No such file or directory). See the comment on feed_all for valgrind.
+    TSC ticks:    52276216  (522.8 / message)
+    wall time:    24.90 ms  (4.02 M msgs/s, 0.88 GB/s)
+```
+
+On that machine the instruction count comes from Valgrind instead. Only the
+`I refs` line matters; divide it by 500,000:
+
+```text
+starter$  valgrind --tool=callgrind --toggle-collect='feed_all*' ./tests bench
+==455== I   refs:      842,489,010      # 842,489,010 / 500,000 = 1,685 per message
+solution$ valgrind --tool=callgrind --toggle-collect='feed_all*' ./tests bench
+==463== I   refs:      1,158,492,765    # 1,158,492,765 / 500,000 = 2,317 per message
+```
+
+The Valgrind counts were identical across repeated runs. The wall times
+above came from one run and differ from the medians in the table, which is
+why the instruction count is the number to compare.
+
 Where the extra ~630 instructions per message go:
 
 | Change | ≈ instructions / msg |
