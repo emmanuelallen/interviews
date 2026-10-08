@@ -3,12 +3,30 @@
 **Source:** https://github.com/yutaoz/harpoon, a header-only C++23 streaming FIX
 parser with AVX2 scanning. The README claims about 5.75M msgs/s (1.2 GB/s).
 
-**Format:** 60 minutes in CoderPad, language **C++** (needs C++20 for `std::span`).
+**Format:** 60 minutes in a multi-file CoderPad project, language **C++**
+(C++20 or later).
 
-| File | Use |
+| Path | Use |
 |---|---|
-| `coderpad_starter.cpp` | Paste into CoderPad. It's a single-file, scalar (no AVX2) version of their parser with the same structure and names, plus a test harness. Tests 1–3 pass. Tests 4–12 fail, and test 13 **crashes** (segfault) before the Task 5 fix. Results for tests 1–12 still print first. |
-| `solution.cpp` | Reference solution (interviewer only). All 14 tests pass, and it's clean under ASan/UBSan. Changes are marked `[Task N]`. |
+| `starter/` | Upload this whole folder to CoderPad. It's the candidate's repo with their files **unchanged** (copied from `main` at commit `2b81a7d`), plus two new files: `tests/tests.cc` (the test harness) and `harpoon/price.h` (a stub for Task 6). `CMakeLists.txt` is theirs with a `tests` target added at the end. |
+| `solution/` | Reference solution (interviewer only), the same tree with fixes. All 14 tests pass, and it's clean under ASan/UBSan. Every change is marked `[Task N]`. |
+| `solution.diff` | `starter/` → `solution/` as a diff, for reading the changes quickly. |
+
+**Running the tests** (from the project root):
+
+```sh
+g++ -std=c++20 -O2 -mavx2 -I. tests/tests.cc -o tests && ./tests
+```
+
+Or with CMake: `cmake -B build && cmake --build build && ./build/tests`.
+
+- In the starter, tests 1–3 pass and 4–12 fail. Test 13 then **crashes**
+  (segfault) until Task 5 is fixed; results for tests 1–12 print first.
+- The candidate's SIMD code is kept as-is, so the CoderPad machine needs
+  AVX2. If it doesn't, the tests die with "Illegal instruction" before
+  printing anything. Check that beforehand with `grep -c avx2 /proc/cpuinfo`.
+- Compiler warnings from `dispatch.h` (unused parameters) come from their
+  code. Leave them; they lead into discussion item 1.
 
 **Structure:** the core is Tasks 1–3 (tests 1–9). Tasks 4–6 (tests 10–14) are
 stretch tasks. Pick one or two based on how fast the candidate is and what
@@ -96,6 +114,13 @@ Probe: *"Test 5 and test 6 feed 64-byte chunks. Why does that matter?"*
   passed to the handler as-is.
 - The original also `return`s without calling `on_message_end`, leaving the
   handler in a "message open" state.
+- **Breaking change probe:** adding `on_message_error` breaks every
+  existing handler, including the `Sum5013Handler` in their own
+  `examples/fileparse.cc` (it no longer compiles). Ask: *"Who else uses this
+  interface, and how would you add a callback without breaking them?"*
+  The solution adds an empty method to the example. A stronger answer
+  makes the callback optional with `if constexpr (requires {
+  handler.on_message_error(); })`.
 - **Design probe:** *"The handler has already seen `35=D` before you find
   the error. Is that ok? What would you change if the handler was placing
   orders?"* Options: validate in a first pass before calling handlers, or
@@ -154,7 +179,8 @@ candidate is fast, **Task 5 gives the most signal**.
 ### Task 6: fixed-point prices (≈10 min) → test 12
 
 > "Your example sums prices as `double` with `scale *= 0.1`. Implement
-> `parse_price` to return an `int64_t` with 8 implied decimals."
+> `parse_price` (in `harpoon/price.h`) to return an `int64_t` with 8
+> implied decimals."
 
 - Tests cover signs, the full `int64_t` range (the max passes and one more
   overflows), more than 8 decimals, and malformed inputs (`"1."`, `".5"`,
