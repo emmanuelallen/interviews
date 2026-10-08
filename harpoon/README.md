@@ -15,10 +15,12 @@ parser with AVX2 scanning. The README claims about 5.75M msgs/s (1.2 GB/s).
 **Running the tests** (from the project root):
 
 ```sh
-g++ -std=c++20 -O2 -mavx2 -I. tests/tests.cc -o tests && ./tests
+g++ -std=c++20 -O3 -march=native -mavx2 -DNDEBUG -I. tests/tests.cc -o tests && ./tests
 ```
 
 Or with CMake: `cmake -B build && cmake --build build && ./build/tests`.
+Both use the same compiler flags as their `fileparse` example.
+`./tests bench` runs only the benchmark (see below).
 
 - In the starter, tests 1–3 pass and 4–12 fail. Test 13 then **crashes**
   (segfault) until Task 5 is fixed; results for tests 1–12 print first.
@@ -32,6 +34,53 @@ Or with CMake: `cmake -B build && cmake --build build && ./build/tests`.
 stretch tasks. Pick one or two based on how fast the candidate is and what
 you want to learn. The tests run in file order (10–11, then 12, then 13–14),
 which isn't task order: Task 5's tests run last because they can crash.
+
+### Benchmark: do the fixes slow down their example?
+
+After test 12, the tests run the workload from `examples/fileparse.cc`, then
+continue with tests 13–14. That workload is their `Sum5013Handler`,
+included unchanged. It parses 100,000 messages (22 MB) in the format of their
+`generate_instrument_list_fix.py`, fed in 4096-byte chunks like their example.
+It prints:
+
+- **instructions** (and per message / per byte). This is the number to
+  compare. It's nearly identical across runs, unlike wall time. It needs
+  hardware performance counters, which many VMs (including this repo's test
+  environment, and possibly CoderPad) don't expose. If they're missing it
+  prints "unavailable", so measure with Valgrind instead:
+  `g++ -std=c++20 -O3 -mavx2 -DNDEBUG -I. tests/tests.cc -o tests && valgrind --tool=callgrind --toggle-collect='feed_all*' ./tests bench`.
+  Then divide the `I refs` total by 500,000 (5 runs × 100k messages).
+  Leave out `-march=native` here: Valgrind can't run AVX-512 instructions.
+- **TSC ticks** and **wall time** (best of 5), plus throughput. These are
+  noisy on shared VMs: take the median of several runs.
+- The 5013 count and average, as a correctness check (expect 100000 and
+  1.1250).
+
+**Measured results** (GCC 13, `-O3 -mavx2`, Valgrind instruction counts;
+wall time is the median of 6 alternating runs on a shared cloud VM):
+
+| | instructions / msg | wall time (M msgs/s) |
+|---|---|---|
+| `starter/` (their code) | 1,685 | 5.7 |
+| `solution/` (Tasks 1–6) | 2,317 (**+37.5%**) | 5.05 (≈ −11%) |
+
+The starter's ~5.7M msgs/s matches the 5.75M in their README.
+
+Where the extra ~630 instructions per message go:
+
+| Change | ≈ instructions / msg |
+|---|---|
+| Tag must be digits (Task 3) | +260 |
+| Checksum loop (Task 1, auto-vectorized by GCC) | +165 |
+| RawData state checks (Task 4) | +60 |
+| Header limits and overflow check (Task 2) | +50 |
+
+Even before any fix, about 600 of the 1,685 instructions per message are the
+scalar value scan in `parse_message` (`while (*p != delimiter)`). Their SIMD
+search is only used for framing.
+
+Use this in the interview (it's discussion item 8): have them run
+`./tests bench` before and after their fixes.
 
 The idea is to have them harden **their own design**. Because they already
 know the code, you skip the ramp-up and learn quickly whether they wrote and
@@ -253,6 +302,21 @@ what a strong answer covers.
    whether they build with more than one compiler or standard library.
    *"How would CI catch this?"* A build matrix with GCC and Clang, plus
    libstdc++ and libc++.
+8. **Cost of the fixes.** *"The benchmark says your fixes add about 37%
+   more instructions per message. Where do they go, and how would you win
+   them back?"*
+   - The biggest costs are the per-byte tag check and the separate
+     checksum pass (see the benchmark section).
+   - Ideas: do the checksum inside the same pass that finds delimiters
+     (`_mm256_sad_epu8` for byte sums); use SIMD to find every SOH and
+     `=` in 32 bytes at once with a bitmask instead of scanning byte by
+     byte, which also speeds up their existing value scan (≈600
+     instructions per message); validate tags with one combined comparison.
+   - Strong: they ask whether 37% more instructions matters if wall time
+     only moved about 11% (the parse is partly limited by memory, not only
+     instruction count). They'd measure p99 latency, not only throughput,
+     and decide which checks to keep or make optional (e.g. trust the
+     checksum on a TLS session).
 
 ---
 

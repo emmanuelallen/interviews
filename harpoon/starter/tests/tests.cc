@@ -25,6 +25,21 @@
 #include "harpoon/harpoon.h"
 #include "harpoon/price.h"
 
+// The benchmark runs the handler from the candidate's example unchanged.
+// Renaming main lets us include the file without pulling in its main().
+// <chrono> first: fileparse.cc uses it without including it.
+#include <chrono>
+#define main fileparse_main
+#include "examples/fileparse.cc"
+#undef main
+
+#include <cerrno>
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <x86intrin.h>
+
 constexpr char SOH = '\x01';
 
 // Logs every callback as text so tests can compare against the expected events.
@@ -151,7 +166,168 @@ void check_prices(const char* name, std::initializer_list<PriceCase> cases) {
     report(name, got, expected);
 }
 
-int main() {
+// =============================================================================
+//  Benchmark: the fileparse.cc example's workload
+//
+//  Builds an in-memory feed in the format of
+//  examples/generate_instrument_list_fix.py (written with --soh), then feeds it
+//  in 4096-byte chunks to Parser<Sum5013Handler>, as fileparse.cc does with its
+//  file. Reports CPU instructions when the machine exposes hardware counters,
+//  plus TSC ticks and wall time (best of 5 runs).
+// =============================================================================
+
+std::string bench_feed(std::size_t n) {
+    static const char* symbols[] = {"XBT/USD", "ETH/USD", "SOL/USD", "XRP/USD",
+                                    "ADA/USD", "DOT/USD", "LINK/USD", "LTC/USD"};
+    static const char* m5013[] = {"0.50", "0.75", "1.00", "1.25", "1.50", "1.75"};
+    std::uint64_t rng = 42;
+    auto uuid = [&] {  // deterministic stand-in for uuid4(), same length
+        std::string u;
+        for (int i = 0; i < 32; ++i) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            u += "0123456789abcdef"[rng >> 60];
+            if (i == 7 || i == 11 || i == 15 || i == 19) u += '-';
+        }
+        return u;
+    };
+    char buf[64];
+    std::string feed;
+    for (std::size_t i = 0; i < n; ++i) {
+        std::string sym = symbols[i % 8];
+        bool big = sym.starts_with("XBT") || sym.starts_with("ETH");
+        bool xbt = sym.starts_with("XBT");
+        std::string body;
+        auto field = [&](const char* tag, const std::string& v) {
+            body += tag; body += '='; body += v; body += SOH;
+        };
+        field("35", "y");
+        field("320", "REQ-" + uuid());
+        field("322", "RESP-" + uuid());
+        field("560", "0");
+        field("146", "1");
+        field("55", sym);
+        std::snprintf(buf, sizeof buf, "%.8f", 0.00000001 * (1 + i % 5));
+        field("562", buf);
+        field("5010", big ? "8" : "6");
+        std::snprintf(buf, sizeof buf, "%.4f", 0.0001 * (1 + i % 7));
+        field("5011", buf);
+        field("5012", std::to_string(1000 + 100 * (i % 9)));
+        field("5013", m5013[i % 6]);
+        field("2349", xbt ? "1" : "2");
+        field("5022", xbt ? "0.1" : "0.01");
+        field("5032", "1");
+
+        std::string msg = "8=FIX.4.4";
+        msg += SOH;
+        msg += "9=" + std::to_string(body.size());
+        msg += SOH;
+        msg += body;
+        unsigned sum = 0;
+        for (unsigned char c : msg) sum += c;
+        std::snprintf(buf, sizeof buf, "10=%03u", sum % 256);
+        msg += buf;
+        msg += SOH;
+        feed += msg;
+    }
+    return feed;
+}
+
+// User-space instruction counter via perf_event_open. Many VMs and sandboxes
+// (possibly CoderPad) don't expose hardware counters; then ok() is false.
+struct InstructionCounter {
+    int fd = -1;
+    int err = 0;
+
+    InstructionCounter() {
+        perf_event_attr attr{};
+        attr.size = sizeof attr;
+        attr.type = PERF_TYPE_HARDWARE;
+        attr.config = PERF_COUNT_HW_INSTRUCTIONS;
+        attr.disabled = 1;
+        attr.exclude_kernel = 1;
+        attr.exclude_hv = 1;
+        fd = static_cast<int>(syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0));
+        if (fd < 0) err = errno;
+    }
+    ~InstructionCounter() { if (fd >= 0) close(fd); }
+    bool ok() const { return fd >= 0; }
+    void start() {
+        ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+        ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+    }
+    long long stop() {
+        ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+        long long v = 0;
+        return read(fd, &v, sizeof v) == sizeof v ? v : -1;
+    }
+};
+
+// The measured work: what fileparse.cc's read loop does, minus the file I/O.
+// noinline so profilers can isolate it, e.g.
+//   valgrind --tool=callgrind --toggle-collect='feed_all*' ./tests bench
+__attribute__((noinline)) void feed_all(harpoon::Parser<Sum5013Handler>& p,
+                                        const std::string& feed) {
+    constexpr std::size_t chunk = 4096;  // same read size as fileparse.cc
+    for (std::size_t i = 0; i < feed.size(); i += chunk)
+        p.feed({feed.data() + i, std::min(chunk, feed.size() - i)});
+}
+
+void run_benchmark() {
+    constexpr std::size_t n = 100000;
+    constexpr int runs = 5;
+    const std::string feed = bench_feed(n);
+    InstructionCounter counter;
+
+    long long best_instr = -1;
+    unsigned long long best_ticks = ~0ULL;
+    double best_ms = 1e300;
+    Sum5013Handler result;
+
+    for (int r = 0; r < runs; ++r) {
+        Sum5013Handler handler;
+        harpoon::Parser<Sum5013Handler> p{handler};
+
+        if (counter.ok()) counter.start();
+        auto t0 = std::chrono::steady_clock::now();
+        unsigned long long c0 = __rdtsc();
+        feed_all(p, feed);
+        unsigned long long c1 = __rdtsc();
+        auto t1 = std::chrono::steady_clock::now();
+        long long instr = counter.ok() ? counter.stop() : -1;
+
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (instr >= 0 && (best_instr < 0 || instr < best_instr)) best_instr = instr;
+        best_ticks = std::min(best_ticks, c1 - c0);
+        best_ms = std::min(best_ms, ms);
+        result = handler;
+    }
+
+    std::printf("\n[BENCH] fileparse.cc workload: %zu messages, %.1f MB, "
+                "4096-byte chunks, best of %d\n",
+                n, feed.size() / 1e6, runs);
+    std::printf("    5013 count: %zu (expect %zu)  5013 average: %.4f (expect 1.1250)\n",
+                result.count, n, result.count ? result.sum / result.count : 0.0);
+    if (best_instr >= 0)
+        std::printf("    instructions: %lld  (%.1f / message, %.2f / byte)\n",
+                    best_instr, double(best_instr) / n,
+                    double(best_instr) / feed.size());
+    else
+        std::printf("    instructions: unavailable (perf_event_open: %s). "
+                    "See the comment on feed_all for valgrind.\n",
+                    std::strerror(counter.err));
+    std::printf("    TSC ticks:    %llu  (%.1f / message)\n",
+                best_ticks, double(best_ticks) / n);
+    std::printf("    wall time:    %.2f ms  (%.2f M msgs/s, %.2f GB/s)\n\n",
+                best_ms, n / best_ms / 1e3, feed.size() / best_ms / 1e6);
+    std::fflush(stdout);
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "bench") == 0) {
+        run_benchmark();
+        return 0;
+    }
+
     const std::string A = make_msg("35=D|55=XBT/USD|");
     const std::string B = make_msg("35=8|55=ETH/USD|");
     const std::string hdr = "B 8=FIX.4.4 9=16 ";
@@ -230,6 +406,11 @@ int main() {
         {"+1", false, 0},
         {"1e5", false, 0},
     });
+
+    // ---- Benchmark --------------------------------------------------------
+    // Runs before Task 5's tests, which can crash. `./tests bench` runs only
+    // this.
+    run_benchmark();
 
     // ---- Task 5: re-entrant feed() ---------------------------------------
     // A handler may call feed() on the same parser from inside a callback.
